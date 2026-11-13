@@ -24,6 +24,15 @@ void wq_set_deleting_allowed(BOOL allowed);
 // backup an app restore makes first is deleted once the restore succeeded.
 BOOL wq_keep_before_restore(void);
 void wq_set_keep_before_restore(BOOL keep);
+// Settings → Backup Mode (IPA + Data by default).
+typedef NS_ENUM(NSInteger, WQAppBackupMode) {
+    WQAppBackupModeIPAAndData = 0,
+    WQAppBackupModeIPAOnly = 1,
+    WQAppBackupModeDataOnly = 2,
+};
+WQAppBackupMode wq_app_backup_mode(void);
+void wq_set_app_backup_mode(WQAppBackupMode mode);
+NSString *wq_app_backup_mode_title(WQAppBackupMode mode);
 // YES (after telling the user) when deleting is turned off.
 BOOL wq_refuse_if_deleting_off(UIViewController *host);
 // title/message/action titles are localization keys. Pass already-localized

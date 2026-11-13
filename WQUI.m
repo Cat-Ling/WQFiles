@@ -324,6 +324,30 @@ void wq_set_keep_before_restore(BOOL keep)
     [NSUserDefaults.standardUserDefaults setBool:!keep forKey:kWQDiscardBeforeRestorePref];
 }
 
+static NSString *const kWQAppBackupModePref = @"WQAppBackupMode";
+
+WQAppBackupMode wq_app_backup_mode(void)
+{
+    NSInteger raw = [NSUserDefaults.standardUserDefaults integerForKey:kWQAppBackupModePref];
+    if (raw < WQAppBackupModeIPAAndData || raw > WQAppBackupModeDataOnly) return WQAppBackupModeIPAAndData;
+    return (WQAppBackupMode)raw;
+}
+
+void wq_set_app_backup_mode(WQAppBackupMode mode)
+{
+    [NSUserDefaults.standardUserDefaults setInteger:mode forKey:kWQAppBackupModePref];
+}
+
+NSString *wq_app_backup_mode_title(WQAppBackupMode mode)
+{
+    switch (mode) {
+        case WQAppBackupModeIPAOnly: return WQLocalized(@"IPA Only");
+        case WQAppBackupModeDataOnly: return WQLocalized(@"Data Only");
+        case WQAppBackupModeIPAAndData:
+        default: return WQLocalized(@"IPA + Data");
+    }
+}
+
 BOOL wq_refuse_if_deleting_off(UIViewController *host)
 {
     if (wq_deleting_allowed()) return NO;

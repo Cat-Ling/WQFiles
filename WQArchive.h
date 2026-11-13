@@ -60,6 +60,14 @@ BOOL wq_zip_write(NSArray<NSString *> *paths, NSString *zipPath, WQArchiveIO *io
                   WQArchiveCancelled _Nullable cancelled, WQArchiveProgress _Nullable progress,
                   NSUInteger *_Nullable skipped, NSString *_Nullable *_Nullable errorText);
 
+// Writes a ZIP where each path in `paths` is placed at the matching relative
+// archive path in `archiveNames` (for example "Payload/App.app"). Parent
+// directory entries are emitted automatically.
+BOOL wq_zip_write_named(NSArray<NSString *> *paths, NSArray<NSString *> *archiveNames,
+                        NSString *zipPath, WQArchiveIO *io,
+                        WQArchiveCancelled _Nullable cancelled, WQArchiveProgress _Nullable progress,
+                        NSUInteger *_Nullable skipped, NSString *_Nullable *_Nullable errorText);
+
 // Extracts the ZIP at zipPath (read through io) into the existing local folder
 // outDir. Refuses archives that would unpack to more than maxBytes, encrypted
 // entries, unsupported compression, more than kWQZipMaxEntries entries and

@@ -6,6 +6,9 @@ NSString *_Nullable wq_recover_interrupted_restore(void);
 
 @interface WQAppsViewController : UITableViewController <UISearchResultsUpdating>
 // Opens Apps and, once the list is read, offers to restore this app's backup
-// (from the App Backups long-press menu).
+// (from App Backups).
 - (nonnull instancetype)initRestoringBundleID:(nonnull NSString *)bundleID;
+@end
+
+@interface WQAppBackupsViewController : UITableViewController
 @end

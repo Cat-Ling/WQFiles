@@ -297,23 +297,54 @@ static BOOL wq_zip_central_directory(WQZipWriter *w)
     return YES;
 }
 
-BOOL wq_zip_write(NSArray<NSString *> *paths, NSString *zipPath, WQArchiveIO *io,
-                  WQArchiveCancelled cancelled, WQArchiveProgress progress,
-                  NSUInteger *skipped, NSString **errorText)
+static BOOL wq_zip_emit_parent_dirs(WQZipWriter *w, NSString *archiveName, NSMutableSet<NSString *> *seenNames)
 {
-    if (paths.count == 0) { if (errorText) *errorText = WQLocalized(@"Nothing to compress"); return NO; }
+    NSArray<NSString *> *parts = [archiveName componentsSeparatedByString:@"/"];
+    if (parts.count <= 1) return YES;
+    NSMutableString *dir = [NSMutableString new];
+    for (NSUInteger i = 0; i + 1 < parts.count; i++) {
+        if (dir.length) [dir appendString:@"/"];
+        [dir appendString:parts[i]];
+        if ([seenNames containsObject:dir]) continue;
+        [seenNames addObject:[dir copy]];
+        WQZipEntry *e = [WQZipEntry new];
+        e.name = [[dir stringByAppendingString:@"/"] dataUsingEncoding:NSUTF8StringEncoding];
+        e.dir = YES;
+        e.mode = 0755;
+        uint16_t t, d;
+        wq_dos_time(time(NULL), &t, &d);
+        e.time = t;
+        e.date = d;
+        if (!wq_zip_local_header(w, e)) return NO;
+    }
+    return YES;
+}
+
+BOOL wq_zip_write_named(NSArray<NSString *> *paths, NSArray<NSString *> *archiveNames,
+                        NSString *zipPath, WQArchiveIO *io,
+                        WQArchiveCancelled cancelled, WQArchiveProgress progress,
+                        NSUInteger *skipped, NSString **errorText)
+{
+    if (paths.count == 0 || paths.count != archiveNames.count) {
+        if (errorText) *errorText = WQLocalized(@"Nothing to compress");
+        return NO;
+    }
     int out = open(zipPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (out < 0) { if (errorText) *errorText = @(strerror(errno)); return NO; }
     NSMutableArray *entries = [NSMutableArray new];
     NSString *error = nil;
     WQZipWriter w = { .out = out, .entries = entries, .io = io, .cancelled = cancelled, .progress = progress };
     BOOL ok = YES;
-    NSMutableSet<NSString *> *topNames = [NSMutableSet new];
-    for (NSString *path in paths) {
-        NSString *name = path.lastPathComponent;
-        if (!name.length || [topNames containsObject:name]) { ok = wq_zip_fail(&w, WQLocalized(@"Two selected items have the same name")); break; }
-        [topNames addObject:name];
-        if (!(ok = wq_zip_add(&w, path, name, 0))) break;
+    NSMutableSet<NSString *> *seenNames = [NSMutableSet new];
+    for (NSUInteger i = 0; i < paths.count; i++) {
+        NSString *name = wq_zip_safe_entry_path(archiveNames[i]);
+        if (!name.length || [seenNames containsObject:name]) {
+            ok = wq_zip_fail(&w, WQLocalized(@"Two selected items have the same name"));
+            break;
+        }
+        if (!(ok = wq_zip_emit_parent_dirs(&w, name, seenNames))) break;
+        [seenNames addObject:name];
+        if (!(ok = wq_zip_add(&w, paths[i], name, 0))) break;
     }
     if (ok) ok = wq_zip_central_directory(&w);
     if (ok && fsync(out) != 0) ok = wq_zip_fail(&w, @(strerror(errno)));
@@ -323,6 +354,23 @@ BOOL wq_zip_write(NSArray<NSString *> *paths, NSString *zipPath, WQArchiveIO *io
     if (skipped) *skipped = w.skipped;
     if (!ok && errorText) *errorText = error ?: WQLocalized(@"Could not create the ZIP");
     return ok;
+}
+
+BOOL wq_zip_write(NSArray<NSString *> *paths, NSString *zipPath, WQArchiveIO *io,
+                  WQArchiveCancelled cancelled, WQArchiveProgress progress,
+                  NSUInteger *skipped, NSString **errorText)
+{
+    if (paths.count == 0) { if (errorText) *errorText = WQLocalized(@"Nothing to compress"); return NO; }
+    NSMutableArray<NSString *> *names = [NSMutableArray arrayWithCapacity:paths.count];
+    for (NSString *path in paths) {
+        NSString *name = path.lastPathComponent;
+        if (!name.length || [name isEqualToString:@"."]) {
+            if (errorText) *errorText = WQLocalized(@"Two selected items have the same name");
+            return NO;
+        }
+        [names addObject:name];
+    }
+    return wq_zip_write_named(paths, names, zipPath, io, cancelled, progress, skipped, errorText);
 }
 
 #pragma mark Reading

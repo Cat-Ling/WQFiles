@@ -397,6 +397,32 @@ int main(void)
         NSString *outLong = tmpdir(@"outLong");
         CHECK(!wq_zip_extract(longZip, outLong, io, 1ull << 40, nil, nil, nil, nil, &err) && [err containsString:@"too long"], @"long: %@", err);
         CHECK([fm contentsOfDirectoryAtPath:outLong error:nil].count == 0, @"long zip wrote files");
+
+        // Named multi-root packaging (Payload/<App>.app + container metadata at root).
+        NSString *ipaSrc = tmpdir(@"ipaSrc");
+        NSString *bundleDir = [ipaSrc stringByAppendingPathComponent:@"Sample.app"];
+        [fm createDirectoryAtPath:[bundleDir stringByAppendingPathComponent:@"SC_Info"] withIntermediateDirectories:YES attributes:nil error:nil];
+        put([bundleDir stringByAppendingPathComponent:@"Info.plist"], [@"plist" dataUsingEncoding:NSUTF8StringEncoding]);
+        put([bundleDir stringByAppendingPathComponent:@"SC_Info/Sample.sinf"], [@"sinf" dataUsingEncoding:NSUTF8StringEncoding]);
+        NSString *metaFile = [ipaSrc stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+        put(metaFile, [@"meta" dataUsingEncoding:NSUTF8StringEncoding]);
+        NSString *storeKitDir = [ipaSrc stringByAppendingPathComponent:@"StoreKit"];
+        [fm createDirectoryAtPath:storeKitDir withIntermediateDirectories:YES attributes:nil error:nil];
+        put([storeKitDir stringByAppendingPathComponent:@"receipt"], [@"rcpt" dataUsingEncoding:NSUTF8StringEncoding]);
+        NSString *namedZip = [ipaSrc stringByAppendingPathComponent:@"out.ipa"];
+        err = nil;
+        CHECK(wq_zip_write_named(@[bundleDir, metaFile, storeKitDir],
+                                 @[@"Payload/Sample.app", @"iTunesMetadata.plist", @"StoreKit"],
+                                 namedZip, io, nil, nil, nil, &err),
+              @"named ipa write: %@", err);
+        NSString *outIPA = tmpdir(@"outIPA");
+        files = 0;
+        CHECK(wq_zip_extract(namedZip, outIPA, io, 1ull << 40, nil, nil, &files, nil, &err) && files == 4,
+              @"named ipa extract: %@ (files=%lu)", err, (unsigned long)files);
+        CHECK([fm fileExistsAtPath:[outIPA stringByAppendingPathComponent:@"Payload/Sample.app/Info.plist"]], @"missing Payload Info.plist");
+        CHECK([fm fileExistsAtPath:[outIPA stringByAppendingPathComponent:@"Payload/Sample.app/SC_Info/Sample.sinf"]], @"missing Payload SC_Info");
+        CHECK([fm fileExistsAtPath:[outIPA stringByAppendingPathComponent:@"iTunesMetadata.plist"]], @"missing root iTunesMetadata.plist");
+        CHECK([fm fileExistsAtPath:[outIPA stringByAppendingPathComponent:@"StoreKit/receipt"]], @"missing root StoreKit/receipt");
     }
     if (failures) { printf("WQArchiveTests: %d failure(s)\n", failures); return 1; }
     printf("WQArchiveTests: all passed\n");

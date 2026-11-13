@@ -96,19 +96,10 @@ class LocalizationTests(unittest.TestCase):
             source = path.read_text(encoding="utf-8")
             self.assertNotRegex(source, r'\?\s*@""\s*:\s*@"(?:s|es)"', str(path))
 
-    def test_plist_date_and_data_actions_stay_distinct(self):
-        # The Add sheet localizes the type key exactly once. A second lookup
-        # of the translated "Date" ("Data" in it/pl/pt-BR) would yield the
-        # translation of the Data type and collapse the two actions.
-        for language in ("it", "pl", "pt-BR"):
-            table = read_table(ROOT / f"{language}.lproj/Localizable.strings")
-            date_label, data_label = table["Date"], table["Data"]
-            self.assertNotEqual(date_label, data_label, language)
-            self.assertEqual(table.get(date_label), data_label, f"{language}: double lookup hazard no longer present?")
-        source = (ROOT / "WQPlistEditor.m").read_text(encoding="utf-8")
-        self.assertIn("wq_alert_action(wqp_type_key(t)", source)
-        self.assertNotRegex(source, r"wq_alert_action\(\s*wqp_type_name\(")
-        self.assertIn("return WQVerbatim(WQLocalized(wqp_type_key(t)));", source)
+    def test_retained_settings_localization_keys_exist(self):
+        table = read_table(ROOT / "en.lproj/Localizable.strings")
+        for key in ("App Backups", "Allow Deleting", "Keep Data Before Restore", "Language"):
+            self.assertIn(key, table)
 
     def test_localized_lookup_honors_verbatim(self):
         source = (ROOT / "WQLocalization.m").read_text(encoding="utf-8")

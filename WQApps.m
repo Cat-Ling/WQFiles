@@ -5,7 +5,6 @@
 //
 
 #import "WQApps.h"
-#import "WQDir.h"
 #import "WQUI.h"
 #import "WQSharing.h"
 #import "WQAccess.h"
@@ -32,6 +31,7 @@
 @property (nonatomic) dev_t containerDevice;
 @property (nonatomic) ino_t containerInode;
 @property (nonatomic, copy) NSArray<NSDictionary *> *backups;
+@property (nonatomic, copy) NSArray<NSDictionary *> *ipaBackups;
 @property (nonatomic) NSInteger installState;   // WQInstallState
 @end
 @implementation WQAppItem
@@ -531,6 +531,231 @@ static NSString *wq_make_app_backup(NSString *bundleID, NSString *container, dev
     }, error);
 }
 
+static NSArray<NSDictionary *> *wq_app_ipa_backups(NSString *bundleID)
+{
+    NSString *root = wq_app_backup_root_for_bundle(bundleID);
+    NSArray *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:nil];
+    NSMutableArray *out = [NSMutableArray new];
+    for (NSString *name in names) {
+        if ([name hasPrefix:@"."]) continue;
+        if (![name.pathExtension.lowercaseString isEqualToString:@"ipa"]) continue;
+        NSString *path = [root stringByAppendingPathComponent:name];
+        struct stat st;
+        if (lstat(path.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+        NSDate *created = attrs[NSFileCreationDate] ?: attrs[NSFileModificationDate] ?: NSDate.distantPast;
+        [out addObject:@{ @"path": path, @"name": name, @"bytes": @((unsigned long long)st.st_size), @"created": created }];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult order = [b[@"created"] compare:a[@"created"]];
+        return order != NSOrderedSame ? order : [b[@"name"] compare:a[@"name"] options:NSNumericSearch];
+    }];
+    return out;
+}
+
+static BOOL wq_verify_readable_dir(NSString *dir, NSString *label, NSString **error)
+{
+    NSArray<NSString *> *entries = wq_list(dir, error);
+    if (!entries) {
+        if (error && !*error) *error = WQLocalizedFormat(@"Cannot read %@", label);
+        return NO;
+    }
+    for (NSString *name in entries) {
+        NSString *child = [dir stringByAppendingPathComponent:name];
+        struct stat st;
+        if (!wq_stat(child, &st)) {
+            if (error) *error = WQLocalizedFormat(@"Cannot inspect %@/%@", label, name);
+            return NO;
+        }
+        if (S_ISREG(st.st_mode)) {
+            int fd = wq_open_for_reading(child);
+            if (fd < 0) {
+                if (error) *error = WQLocalizedFormat(@"Cannot read %@/%@ (%s)", label, name, strerror(errno));
+                return NO;
+            }
+            close(fd);
+        } else if (S_ISDIR(st.st_mode)) {
+            if (!wq_verify_readable_dir(child, [label stringByAppendingPathComponent:name], error)) return NO;
+        }
+    }
+    return YES;
+}
+
+static NSString *wq_sanitize_filename_component(NSString *text)
+{
+    if (!text.length) return @"App";
+    NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"/:\\"];
+    NSString *cleaned = [[text componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"-"];
+    cleaned = [cleaned stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return (cleaned.length && ![cleaned hasPrefix:@"."]) ? cleaned : @"App";
+}
+
+// Packages the installed .app bundle (including SC_Info and _CodeSignature)
+// together with container-level iTunesMetadata.plist, iTunesArtwork, META-INF,
+// and StoreKit if present, into AppBackups/<bundleID>/<App> (<stamp>).ipa.
+static NSString *wq_make_app_ipa(NSString *bundleID, NSString *appName,
+                                 BOOL (^cancelled)(void), NSString **includedSummary,
+                                 NSString **error)
+{
+    if (includedSummary) *includedSummary = nil;
+    if (!WQAppsSupportBundleIDValid(bundleID)) {
+        if (error) *error = WQLocalized(@"The app identifier is not a valid bundle identifier");
+        return nil;
+    }
+    NSString *bundlePath = wq_bundle_path_for_id(bundleID);
+    if (!bundlePath.length) {
+        if (error) *error = WQLocalized(@"The app bundle path could not be found");
+        return nil;
+    }
+    if ([bundlePath hasPrefix:@"/Applications/"] || [bundlePath hasPrefix:@"/System/"]) {
+        if (error) *error = WQLocalized(@"Built-in system apps cannot be backed up as an IPA.");
+        return nil;
+    }
+    NSString *bundleContainer = bundlePath.stringByDeletingLastPathComponent;
+    wq_grant(bundleContainer);
+    wq_grant(bundlePath);
+
+    struct stat bundleStat;
+    if (!wq_stat(bundlePath, &bundleStat) || !S_ISDIR(bundleStat.st_mode)) {
+        if (error) *error = WQLocalized(@"The app bundle cannot be accessed on this device.");
+        return nil;
+    }
+    NSString *plistPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+    NSString *readError = nil;
+    NSData *plistData = wq_read(plistPath, 4 * 1024 * 1024, &readError);
+    id info = plistData ? [NSPropertyListSerialization propertyListWithData:plistData options:0 format:NULL error:nil] : nil;
+    if (![info isKindOfClass:NSDictionary.class]) {
+        if (error) *error = WQLocalizedFormat(@"Cannot read %@/Info.plist (%@).",
+                                              bundlePath.lastPathComponent, readError ?: WQLocalized(@"permission denied"));
+        return nil;
+    }
+    NSString *executable = [info[@"CFBundleExecutable"] isKindOfClass:NSString.class] ? info[@"CFBundleExecutable"] : nil;
+    if (!executable.length || [executable containsString:@"/"]) {
+        if (error) *error = WQLocalized(@"Info.plist does not specify a valid executable.");
+        return nil;
+    }
+    NSString *exePath = [bundlePath stringByAppendingPathComponent:executable];
+    struct stat exeStat;
+    if (!wq_stat(exePath, &exeStat)) {
+        if (errno == ENOENT) {
+            if (error) *error = WQLocalizedFormat(@"%@ is offloaded (its executable is missing), so an IPA cannot be created.", appName ?: bundleID);
+        } else {
+            if (error) *error = WQLocalizedFormat(@"Cannot access the app executable (%s).", strerror(errno));
+        }
+        return nil;
+    }
+    int exeFD = wq_open_for_reading(exePath);
+    if (exeFD < 0) {
+        if (error) *error = WQLocalizedFormat(@"Cannot read the app executable (%s). iOS may block reading installed app bundles on this version.", strerror(errno));
+        return nil;
+    }
+    close(exeFD);
+
+    NSMutableArray<NSString *> *includedItems = [NSMutableArray new];
+    NSString *scInfoPath = [bundlePath stringByAppendingPathComponent:@"SC_Info"];
+    struct stat scStat;
+    if (wq_stat(scInfoPath, &scStat) && S_ISDIR(scStat.st_mode)) {
+        if (!wq_verify_readable_dir(scInfoPath, @"SC_Info", error)) return nil;
+        [includedItems addObject:@"SC_Info"];
+    }
+    NSString *codeSigPath = [bundlePath stringByAppendingPathComponent:@"_CodeSignature"];
+    struct stat sigStat;
+    if (wq_stat(codeSigPath, &sigStat) && S_ISDIR(sigStat.st_mode)) {
+        if (!wq_verify_readable_dir(codeSigPath, @"_CodeSignature", error)) return nil;
+        [includedItems addObject:@"_CodeSignature"];
+    }
+
+    NSMutableArray<NSString *> *srcPaths = [NSMutableArray new];
+    NSMutableArray<NSString *> *archiveNames = [NSMutableArray new];
+    [srcPaths addObject:bundlePath];
+    [archiveNames addObject:[@"Payload" stringByAppendingPathComponent:bundlePath.lastPathComponent]];
+
+    for (NSString *metaName in @[@"iTunesMetadata.plist", @"iTunesArtwork", @"iTunesArtwork@2x"]) {
+        NSString *metaPath = [bundleContainer stringByAppendingPathComponent:metaName];
+        struct stat metaStat;
+        if (!wq_stat(metaPath, &metaStat)) continue;
+        if (!S_ISREG(metaStat.st_mode)) continue;
+        int metaFD = wq_open_for_reading(metaPath);
+        if (metaFD < 0) {
+            if (error) *error = WQLocalizedFormat(@"Cannot read %@ (%s).", metaName, strerror(errno));
+            return nil;
+        }
+        close(metaFD);
+        [srcPaths addObject:metaPath];
+        [archiveNames addObject:metaName];
+        [includedItems addObject:metaName];
+    }
+    for (NSString *metaDir in @[@"META-INF", @"StoreKit"]) {
+        NSString *dirPath = [bundleContainer stringByAppendingPathComponent:metaDir];
+        struct stat dirStat;
+        if (!wq_stat(dirPath, &dirStat) || !S_ISDIR(dirStat.st_mode)) continue;
+        if (!wq_verify_readable_dir(dirPath, metaDir, error)) return nil;
+        [srcPaths addObject:dirPath];
+        [archiveNames addObject:metaDir];
+        [includedItems addObject:metaDir];
+    }
+    NSString *embeddedStoreKit = [bundlePath stringByAppendingPathComponent:@"StoreKit"];
+    struct stat embeddedSKStat;
+    if (wq_stat(embeddedStoreKit, &embeddedSKStat) && S_ISDIR(embeddedSKStat.st_mode)) {
+        if (!wq_verify_readable_dir(embeddedStoreKit, @"StoreKit", error)) return nil;
+        if (![includedItems containsObject:@"StoreKit"]) [includedItems addObject:@"StoreKit"];
+    }
+
+    NSString *root = wq_app_backup_root_for_bundle(bundleID);
+    if (!root.length) {
+        if (error) *error = WQLocalized(@"Cannot locate the app backup folder");
+        return nil;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *name in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        if ([name hasPrefix:kBackupStagingPrefix]) [fm removeItemAtPath:[root stringByAppendingPathComponent:name] error:nil];
+    }
+    NSString *staging = [root stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"%@%@.ipa", kBackupStagingPrefix, NSUUID.UUID.UUIDString]];
+
+    WQArchiveIO *io = [WQArchiveIO new];
+    io.stat = ^BOOL(NSString *path, struct stat *st) { return wq_stat(path, st); };
+    io.list = ^NSArray<NSString *> *(NSString *path) { return wq_list(path, NULL); };
+    io.openRead = ^int(NSString *path) { return wq_open_for_reading(path); };
+    io.skipUnreadable = NO;
+
+    NSUInteger skipped = 0;
+    NSString *zipError = nil;
+    BOOL ok = wq_zip_write_named(srcPaths, archiveNames, staging, io, cancelled, nil, &skipped, &zipError);
+    if (!ok) {
+        [fm removeItemAtPath:staging error:nil];
+        if (error) *error = zipError ?: WQLocalized(@"Could not create the IPA");
+        wq_log(@"app ipa %@: FAILED (%@)", bundleID, error && *error ? *error : @"?");
+        return nil;
+    }
+
+    NSString *shortVer = [info[@"CFBundleShortVersionString"] isKindOfClass:NSString.class] ? info[@"CFBundleShortVersionString"] : nil;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.dateFormat = @"yyyy-MM-dd HH.mm.ss";
+    NSString *stamp = [fmt stringFromDate:NSDate.date];
+    NSString *cleanApp = wq_sanitize_filename_component(appName ?: bundlePath.lastPathComponent.stringByDeletingPathExtension);
+    NSString *baseName = shortVer.length
+        ? [NSString stringWithFormat:@"%@ %@ (%@)", cleanApp, wq_sanitize_filename_component(shortVer), stamp]
+        : [NSString stringWithFormat:@"%@ (%@)", cleanApp, stamp];
+    NSString *final = [root stringByAppendingPathComponent:[baseName stringByAppendingPathExtension:@"ipa"]];
+    for (NSUInteger n = 2; [fm fileExistsAtPath:final]; n++) {
+        final = [root stringByAppendingPathComponent:
+                 [[NSString stringWithFormat:@"%@ (%lu)", baseName, (unsigned long)n] stringByAppendingPathExtension:@"ipa"]];
+    }
+    if (rename(staging.fileSystemRepresentation, final.fileSystemRepresentation) != 0) {
+        int err = errno;
+        [fm removeItemAtPath:staging error:nil];
+        if (error) *error = WQLocalizedFormat(@"Cannot finish the IPA (errno %d)", err);
+        return nil;
+    }
+    NSString *summary = includedItems.count ? [includedItems componentsJoinedByString:@", "] : @"bundle only";
+    if (includedSummary) *includedSummary = summary;
+    wq_log(@"app ipa %@ -> %@ (%@; %lu links/special skipped)", bundleID, final.lastPathComponent, summary, (unsigned long)skipped);
+    return final;
+}
+
 static BOOL wq_dir_size_cancellable(NSString *dir, WQScanCancellation *cancellation,
                                      unsigned long long *sizeOut, BOOL *completeOut)
 {
@@ -590,14 +815,23 @@ static BOOL wq_dir_size_cancellable(NSString *dir, WQScanCancellation *cancellat
     NSUInteger generation = _scanGeneration;
     dispatch_async(wq_io(), ^{
         NSMutableArray *lists = [NSMutableArray arrayWithCapacity:apps.count];
-        for (WQAppItem *app in apps) [lists addObject:app.bundleID.length ? wq_app_backups(app.bundleID) : @[]];
+        NSMutableArray *ipaLists = [NSMutableArray arrayWithCapacity:apps.count];
+        for (WQAppItem *app in apps) {
+            [lists addObject:app.bundleID.length ? wq_app_backups(app.bundleID) : @[]];
+            [ipaLists addObject:app.bundleID.length ? wq_app_ipa_backups(app.bundleID) : @[]];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self->_scanGeneration || self->_scanning) return;
             BOOL changed = NO;
             for (NSUInteger i = 0; i < apps.count; i++) {
-                if ([apps[i].backups isEqualToArray:lists[i]]) continue;
-                apps[i].backups = lists[i];
-                changed = YES;
+                if (![apps[i].backups isEqualToArray:lists[i]]) {
+                    apps[i].backups = lists[i];
+                    changed = YES;
+                }
+                if (![apps[i].ipaBackups isEqualToArray:ipaLists[i]]) {
+                    apps[i].ipaBackups = ipaLists[i];
+                    changed = YES;
+                }
             }
             if (!changed) return;
             [self rebuildVisibleApps];
@@ -747,6 +981,7 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
             app.sizeKnown = sizeKnown;
             if (granted && hasIdentity && !sizeKnown) sizeLimited++;
             app.backups = bid.length ? wq_app_backups(bid) : @[];
+            app.ipaBackups = bid.length ? wq_app_ipa_backups(bid) : @[];
             NSString *why = nil;
             app.installState = bid.length ? wq_app_install_state(bid, &why) : WQInstallUnknown;
             installCounts[app.installState]++;
@@ -819,7 +1054,7 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
             if (filter == 2) return !wq_app_is_apple(a);
             if (filter == 4) return a.installState == WQInstallInstalled;
             if (filter == 5) return a.installState == WQInstallOffloaded;
-            return a.backups.count > 0;
+            return a.backups.count > 0 || a.ipaBackups.count > 0;
         }]];
     }
     if (_query.length) {
@@ -914,13 +1149,12 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
     [self.tableView reloadSectionIndexTitles];
 }
 
-// Long-press: copy the bundle ID or container path, open the data folder.
+// Long-press: copy the bundle ID or container path.
 - (UIContextMenuConfiguration *)tableView:(UITableView *)tableView
     contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point
 {
     if (_busy || (NSUInteger)indexPath.row >= self.visibleApps.count) return nil;
     WQAppItem *app = self.visibleApps[(NSUInteger)indexPath.row];
-    __weak typeof(self) weakSelf = self;
     return [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil
         actionProvider:^UIMenu *(NSArray<UIMenuElement *> *__unused suggested) {
         NSMutableArray *actions = [NSMutableArray new];
@@ -930,23 +1164,6 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
         }
         [actions addObject:[UIAction actionWithTitle:WQLocalizedNullable(@"Copy Container Path") image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil
                                               handler:^(UIAction *__unused a) { UIPasteboard.generalPasteboard.string = app.container; }]];
-        if (app.hasAccess) {
-            [actions addObject:[UIAction actionWithTitle:WQLocalizedNullable(@"Open Data Folder") image:[UIImage systemImageNamed:@"folder"] identifier:nil
-                                                  handler:^(UIAction *__unused a) {
-                [weakSelf.navigationController pushViewController:[[WQDirViewController alloc] initWithPath:app.container title:app.name]
-                                                         animated:YES];
-            }]];
-        }
-        // Only where bundle containers open (see the startup check).
-        NSString *bundlePath = app.bundleID.length && wq_app_bundles_reachable() && wq_display_names_loaded()
-            ? wq_bundle_path_for_id(app.bundleID) : nil;
-        if (bundlePath.length) {
-            [actions addObject:[UIAction actionWithTitle:WQLocalizedNullable(@"Open App Bundle") image:[UIImage systemImageNamed:@"app.badge"] identifier:nil
-                                                  handler:^(UIAction *__unused a) {
-                [weakSelf.navigationController pushViewController:[[WQDirViewController alloc] initWithPath:bundlePath title:app.name]
-                                                         animated:YES];
-            }]];
-        }
         return [UIMenu menuWithChildren:actions];
     }];
 }
@@ -975,7 +1192,7 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
-    return WQLocalized(@"Tap an app to back up, restore or clear its Documents and Library. Close the app first (swipe it away in the app switcher); operations are not snapshot-consistent while it runs. Backups are stored in WQFiles/AppBackups and are visible in the Files app. tmp is cleared when requested but is not backed up or restored.");
+    return WQLocalized(@"Tap an app to back up its IPA and/or data (set in Settings → Backup Mode), restore data, or share an IPA. Close the app first (swipe it away in the app switcher); operations are not snapshot-consistent while it runs. Backups are stored in WQFiles/AppBackups and are visible in the Files app.");
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -992,7 +1209,11 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
     WQAppItem *app = self.visibleApps[(NSUInteger)indexPath.row];
     c.text = app.name;
     NSString *identifier = app.bundleID.length ? app.bundleID : app.container.lastPathComponent;
-    BOOL hasBackup = app.backups.count > 0;
+    BOOL hasDataBackup = app.backups.count > 0;
+    BOOL hasIPABackup = app.ipaBackups.count > 0;
+    NSString *backupBadge = (hasIPABackup && hasDataBackup) ? WQLocalized(@" · IPA & data")
+        : hasIPABackup ? WQLocalized(@" · IPA")
+        : hasDataBackup ? WQLocalized(@" · backed up") : @"";
     if (!app.hasAccess) {
         c.secondaryText = WQLocalizedFormat(@"Access unavailable · %@", identifier);
     } else if (!app.bundleID.length) {
@@ -1000,9 +1221,9 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
     } else if (!app.hasIdentity) {
         c.secondaryText = WQLocalizedFormat(@"%@ · %@ · container identity unavailable", wq_size_text(app.bytes), app.bundleID);
     } else if (!app.sizeKnown) {
-        c.secondaryText = WQLocalizedFormat(@"size unavailable · %@%@", app.bundleID, hasBackup ? WQLocalized(@" · backed up") : @"");
+        c.secondaryText = WQLocalizedFormat(@"size unavailable · %@%@", app.bundleID, backupBadge);
     } else {
-        c.secondaryText = WQLocalizedFormat(@"%@ · %@%@", wq_size_text(app.bytes), app.bundleID, hasBackup ? WQLocalized(@" · backed up") : @"");
+        c.secondaryText = WQLocalizedFormat(@"%@ · %@%@", wq_size_text(app.bytes), app.bundleID, backupBadge);
     }
     if (app.installState == WQInstallOffloaded) c.secondaryText = [c.secondaryText stringByAppendingString:WQLocalized(@" · offloaded")];
     c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
@@ -1025,11 +1246,6 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
             ? WQLocalized(@"The container identifier is unavailable. Backup, restore and clear are disabled for this entry.")
             : WQLocalized(@"Sandbox access is unavailable. Check the App Group and see Log; only the container path can be copied.");
         UIAlertController *sheet = wq_alert_controller(WQVerbatim(app.name), WQVerbatim([NSString stringWithFormat:@"%@\n\n%@", app.container, why]), UIAlertControllerStyleActionSheet);
-        if (app.hasAccess) {
-            [sheet addAction:wq_alert_action(WQLocalized(@"Open Data Folder"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
-                [self.navigationController pushViewController:[[WQDirViewController alloc] initWithPath:app.container title:app.name] animated:YES];
-            })];
-        }
         [sheet addAction:wq_alert_action(WQLocalized(@"Copy Container Path"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
             UIPasteboard.generalPasteboard.string = app.container;
         })];
@@ -1042,12 +1258,28 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
     }
     UIAlertController *sheet = wq_alert_controller(WQVerbatim(app.name), [NSString stringWithFormat:@"%@\n%@", app.bundleID,
                  app.sizeKnown ? WQLocalizedFormat(@"%@ of data", wq_size_text(app.bytes)) : WQLocalized(@"size unavailable")], UIAlertControllerStyleActionSheet);
-    [sheet addAction:wq_alert_action(WQLocalized(@"Back Up Data"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
-        [self backUp:app then:nil];
+    WQAppBackupMode mode = wq_app_backup_mode();
+    NSString *backupTitle = mode == WQAppBackupModeIPAOnly ? WQLocalized(@"Back Up IPA")
+        : mode == WQAppBackupModeDataOnly ? WQLocalized(@"Back Up Data")
+        : WQLocalized(@"Back Up IPA + Data");
+    [sheet addAction:wq_alert_action(backupTitle, UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+        [self backUpWithSettings:app mode:mode];
     })];
     [sheet addAction:wq_alert_action(WQLocalized(@"Import as Backup…"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
         [self pickImportFor:app];
     })];
+    NSArray *ipas = app.ipaBackups;
+    if (ipas.count) {
+        NSString *latestIPA = ipas.firstObject[@"path"];
+        NSString *ipaTitle = ipas.count == 1
+            ? WQLocalizedFormat(@"Share IPA (%@)", wq_size_text([ipas.firstObject[@"bytes"] unsignedLongLongValue]))
+            : WQLocalizedFormat(@"Share an IPA… (%lu)", (unsigned long)ipas.count);
+        [sheet addAction:wq_alert_action(ipaTitle, UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+            UITableViewCell *c = [tableView cellForRowAtIndexPath:indexPath];
+            if (ipas.count == 1) wq_share(self, latestIPA, c);
+            else [self pickIPAToShare:app from:c];
+        })];
+    }
     NSArray *backups = app.backups;
     NSString *latest = backups.firstObject[@"path"];
     if (latest) {
@@ -1066,9 +1298,6 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
             [self confirmClear:app];
         })];
     }
-    [sheet addAction:wq_alert_action(WQLocalized(@"Open Data Folder"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
-        [self.navigationController pushViewController:[[WQDirViewController alloc] initWithPath:app.container title:app.name] animated:YES];
-    })];
     [sheet addAction:wq_alert_action(WQLocalized(@"Copy Bundle ID"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
         UIPasteboard.generalPasteboard.string = app.bundleID;
     })];
@@ -1222,6 +1451,92 @@ static void WQAppScanWatch(WQScanCancellation *cancellation, NSUInteger lastSeri
                               : WQLocalizedFormat(@"Nothing was saved: %@", error ?: @"see Log")];
         });
     });
+}
+
+- (void)backUpWithSettings:(WQAppItem *)app mode:(WQAppBackupMode)mode
+{
+    if (mode == WQAppBackupModeDataOnly) {
+        [self backUp:app then:nil];
+        return;
+    }
+    WQScanCancellation *cancel = [WQScanCancellation new];
+    UIAlertController *hud = wq_alert_controller(WQLocalizedFormat(@"Backing up %@…", app.name),
+                                                 WQLocalized(@"Packaging app bundle and metadata"),
+                                                 UIAlertControllerStyleAlert);
+    [hud addAction:wq_alert_action(WQLocalized(@"Cancel"), UIAlertActionStyleCancel, ^(UIAlertAction *__unused a) {
+        [cancel cancel];
+    })];
+    [self presentViewController:hud animated:YES completion:nil];
+
+    dispatch_async(wq_io(), ^{
+        NSString *ipaError = nil;
+        NSString *included = nil;
+        NSString *ipaDest = wq_make_app_ipa(app.bundleID, app.name, ^BOOL { return cancel.isCancelled; }, &included, &ipaError);
+
+        NSString *dataDest = nil;
+        NSString *dataError = nil;
+        if (mode == WQAppBackupModeIPAAndData && ipaDest && !cancel.isCancelled) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (self.presentedViewController == hud) {
+                    hud.message = WQLocalized(@"Backing up Documents and Library…");
+                }
+            });
+            dataDest = wq_make_app_backup(app.bundleID, app.container, app.containerDevice,
+                                          app.containerInode, nil, &dataError);
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            void (^showResult)(void) = ^{
+                if (cancel.isCancelled) {
+                    [self scan];
+                    return;
+                }
+                if (mode == WQAppBackupModeIPAOnly) {
+                    [self finish:ipaDest ? WQLocalized(@"IPA backed up") : WQLocalized(@"IPA backup failed")
+                         message:ipaDest
+                             ? WQLocalizedFormat(@"Saved to AppBackups/%@/%@ (%@)", app.bundleID, ipaDest.lastPathComponent, included ?: @"")
+                             : WQLocalizedFormat(@"Nothing was saved: %@", ipaError ?: @"see Log")];
+                    return;
+                }
+                if (ipaDest && dataDest) {
+                    [self finish:WQLocalized(@"Backed up")
+                         message:WQLocalizedFormat(@"Saved IPA: %@ (%@)\nSaved data: %@", ipaDest.lastPathComponent, included ?: @"", dataDest.lastPathComponent)];
+                } else if (ipaDest) {
+                    [self finish:WQLocalized(@"Partly backed up")
+                         message:WQLocalizedFormat(@"Saved IPA: %@ (%@)\nData backup failed: %@", ipaDest.lastPathComponent, included ?: @"", dataError ?: @"see Log")];
+                } else {
+                    [self finish:WQLocalized(@"Backup failed")
+                         message:WQLocalizedFormat(@"Could not create IPA: %@", ipaError ?: @"see Log")];
+                }
+            };
+            if (self.presentedViewController == hud) {
+                [hud dismissViewControllerAnimated:YES completion:showResult];
+            } else {
+                showResult();
+            }
+        });
+    });
+}
+
+- (void)pickIPAToShare:(WQAppItem *)app from:(UIView *)source
+{
+    NSArray *ipas = app.ipaBackups;
+    if (!ipas.count) return;
+    if (ipas.count == 1) {
+        wq_share(self, ipas.firstObject[@"path"], source);
+        return;
+    }
+    UIAlertController *sheet = wq_alert_controller(WQLocalized(@"Share which IPA?"), WQVerbatim(app.name), UIAlertControllerStyleActionSheet);
+    for (NSDictionary *entry in ipas) {
+        NSString *label = [NSString stringWithFormat:@"%@ (%@)", entry[@"name"], wq_size_text([entry[@"bytes"] unsignedLongLongValue])];
+        [sheet addAction:wq_alert_action(WQVerbatim(label), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+            wq_share(self, entry[@"path"], source);
+        })];
+    }
+    [sheet addAction:wq_alert_action(WQLocalized(@"Cancel"), UIAlertActionStyleCancel, nil)];
+    sheet.popoverPresentationController.sourceView = source ?: self.view;
+    sheet.popoverPresentationController.sourceRect = (source ?: self.view).bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)clear:(WQAppItem *)app
@@ -1767,6 +2082,201 @@ NSString *wq_recover_interrupted_restore(void)
         : [NSString stringWithFormat:@"%@, and putting the previous data back also failed (%@). It is in backup %@; see the Log.%@",
            error ?: WQLocalized(@"Some files couldn't be written"), rollbackError ?: WQLocalized(@"see Log"), safety.lastPathComponent,
            cleared ? @"" : WQLocalized(@" Recovery will run again at the next launch.")];
+}
+
+@end
+
+#pragma mark - App Backups browser
+
+@implementation WQAppBackupsViewController {
+    NSArray<NSDictionary *> *_entries;   // bundleID, name, ipas, backups
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    self.title = WQLocalizedNullable(@"App Backups");
+    self.tableView.tableHeaderView = wq_device_header(self.view.bounds.size.width);
+    self.refreshControl = [UIRefreshControl new];
+    [self.refreshControl addTarget:self action:@selector(reloadBackups) forControlEvents:UIControlEventValueChanged];
+    [self reloadBackups];
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    [self reloadBackups];
+}
+
+- (void)reloadBackups
+{
+    dispatch_async(wq_io(), ^{
+        if (!wq_display_names_loaded()) wq_load_display_names();
+        NSString *root = wq_app_backup_root();
+        NSArray<NSString *> *dirs = [NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:nil];
+        NSMutableArray<NSDictionary *> *list = [NSMutableArray new];
+        for (NSString *bid in dirs) {
+            if ([bid hasPrefix:@"."] || !WQAppsSupportBundleIDValid(bid)) continue;
+            NSString *appDir = [root stringByAppendingPathComponent:bid];
+            struct stat st;
+            if (lstat(appDir.fileSystemRepresentation, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            NSArray *ipas = wq_app_ipa_backups(bid);
+            NSArray *backups = wq_app_backups(bid);
+            if (!ipas.count && !backups.count) continue;
+            (void)wq_app_icon(bid);
+            NSString *name = wq_display_name(bid) ?: bid;
+            [list addObject:@{ @"bundleID": bid, @"name": name, @"ipas": ipas, @"backups": backups }];
+        }
+        [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"name"] localizedStandardCompare:b[@"name"]];
+        }];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_entries = list;
+            [self.refreshControl endRefreshing];
+            [self.tableView reloadData];
+        });
+    });
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
+{
+    return _entries.count ? (NSInteger)_entries.count : 1;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
+{
+    return WQLocalized(@"Backups are stored in WQFiles/AppBackups and are also visible in the Files app.");
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"ab"]
+        ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"ab"];
+    UIListContentConfiguration *c = cell.defaultContentConfiguration;
+    if (!_entries.count) {
+        c.text = WQLocalized(@"No backups yet");
+        c.secondaryText = nil;
+        c.image = nil;
+        cell.contentConfiguration = c;
+        cell.accessoryType = UITableViewCellAccessoryNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        return cell;
+    }
+    NSDictionary *entry = _entries[(NSUInteger)indexPath.row];
+    NSString *bid = entry[@"bundleID"];
+    NSArray *ipas = entry[@"ipas"];
+    NSArray *backups = entry[@"backups"];
+    NSMutableArray *parts = [NSMutableArray new];
+    if (ipas.count) {
+        unsigned long long ipaBytes = 0;
+        for (NSDictionary *ipa in ipas) ipaBytes += [ipa[@"bytes"] unsignedLongLongValue];
+        [parts addObject:[NSString stringWithFormat:@"%lu IPA (%@)", (unsigned long)ipas.count, wq_size_text(ipaBytes)]];
+    }
+    if (backups.count) {
+        [parts addObject:WQLocalizedFormat(@"%lu data", (unsigned long)backups.count)];
+    }
+    c.text = entry[@"name"];
+    c.secondaryText = [NSString stringWithFormat:@"%@ · %@", bid, [parts componentsJoinedByString:@" · "]];
+    c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+    c.image = wq_app_icon(bid) ?: [UIImage systemImageNamed:@"app.dashed"];
+    c.imageProperties.maximumSize = CGSizeMake(36, 36);
+    cell.contentConfiguration = c;
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (!_entries.count) return;
+    NSDictionary *entry = _entries[(NSUInteger)indexPath.row];
+    NSString *bid = entry[@"bundleID"];
+    NSString *name = entry[@"name"];
+    NSArray *ipas = entry[@"ipas"];
+    NSArray *backups = entry[@"backups"];
+    UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+
+    UIAlertController *sheet = wq_alert_controller(WQVerbatim(name), WQVerbatim(bid), UIAlertControllerStyleActionSheet);
+    for (NSDictionary *ipa in ipas) {
+        NSString *ipaLabel = [NSString stringWithFormat:@"%@ (%@)", ipa[@"name"], wq_size_text([ipa[@"bytes"] unsignedLongLongValue])];
+        [sheet addAction:wq_alert_action(WQVerbatim(ipaLabel), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+            [self openActionsForIPA:ipa bundleID:bid name:name source:cell];
+        })];
+    }
+    if (backups.count) {
+        [sheet addAction:wq_alert_action(WQLocalized(@"Restore Data Backup…"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+            [self.navigationController pushViewController:[[WQAppsViewController alloc] initRestoringBundleID:bid] animated:YES];
+        })];
+    }
+    for (NSDictionary *backup in backups) {
+        NSString *label = WQLocalizedFormat(@"Data: %@", wq_backup_label(backup));
+        [sheet addAction:wq_alert_action(WQVerbatim(label), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+            [self openActionsForDataBackup:backup bundleID:bid name:name source:cell];
+        })];
+    }
+    [sheet addAction:wq_alert_action(WQLocalized(@"Cancel"), UIAlertActionStyleCancel, nil)];
+    sheet.popoverPresentationController.sourceView = cell ?: self.view;
+    sheet.popoverPresentationController.sourceRect = (cell ?: self.view).bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)openActionsForIPA:(NSDictionary *)ipa bundleID:(NSString *)bundleID name:(NSString *)name source:(UIView *)source
+{
+    NSString *path = ipa[@"path"];
+    UIAlertController *sheet = wq_alert_controller(WQVerbatim(ipa[@"name"]), WQVerbatim(wq_size_text([ipa[@"bytes"] unsignedLongLongValue])), UIAlertControllerStyleActionSheet);
+    [sheet addAction:wq_alert_action(WQLocalized(@"Share IPA (AirDrop…)"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+        wq_share(self, path, source);
+    })];
+    if (wq_deleting_allowed()) {
+        [sheet addAction:wq_alert_action(WQLocalized(@"Delete IPA…"), UIAlertActionStyleDestructive, ^(UIAlertAction *__unused a) {
+            UIAlertController *ask = wq_alert_controller(WQLocalized(@"Delete IPA?"), WQVerbatim(ipa[@"name"]), UIAlertControllerStyleAlert);
+            [ask addAction:wq_alert_action(WQLocalized(@"Cancel"), UIAlertActionStyleCancel, nil)];
+            [ask addAction:wq_alert_action(WQLocalized(@"Delete"), UIAlertActionStyleDestructive, ^(UIAlertAction *__unused act) {
+                if (wq_refuse_if_deleting_off(self)) return;
+                if (wq_backup_root_child(path, bundleID)) {
+                    [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+                }
+                [self reloadBackups];
+            })];
+            [self presentViewController:ask animated:YES completion:nil];
+        })];
+    }
+    [sheet addAction:wq_alert_action(WQLocalized(@"Cancel"), UIAlertActionStyleCancel, nil)];
+    sheet.popoverPresentationController.sourceView = source ?: self.view;
+    sheet.popoverPresentationController.sourceRect = (source ?: self.view).bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)openActionsForDataBackup:(NSDictionary *)backup bundleID:(NSString *)bundleID name:(NSString *)name source:(UIView *)source
+{
+    NSString *path = backup[@"path"];
+    UIAlertController *sheet = wq_alert_controller(WQVerbatim(name), WQVerbatim(wq_backup_label(backup)), UIAlertControllerStyleActionSheet);
+    [sheet addAction:wq_alert_action(WQLocalized(@"Restore Data Backup…"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+        [self.navigationController pushViewController:[[WQAppsViewController alloc] initRestoringBundleID:bundleID] animated:YES];
+    })];
+    [sheet addAction:wq_alert_action(WQLocalized(@"Share Backup (AirDrop…)"), UIAlertActionStyleDefault, ^(UIAlertAction *__unused a) {
+        wq_share_folder(self, path, [NSString stringWithFormat:@"%@ %@", name, path.lastPathComponent], source);
+    })];
+    if (wq_deleting_allowed()) {
+        [sheet addAction:wq_alert_action(WQLocalized(@"Delete Backup…"), UIAlertActionStyleDestructive, ^(UIAlertAction *__unused a) {
+            UIAlertController *ask = wq_alert_controller(WQLocalized(@"Delete Backup?"), WQVerbatim(wq_backup_label(backup)), UIAlertControllerStyleAlert);
+            [ask addAction:wq_alert_action(WQLocalized(@"Cancel"), UIAlertActionStyleCancel, nil)];
+            [ask addAction:wq_alert_action(WQLocalized(@"Delete"), UIAlertActionStyleDestructive, ^(UIAlertAction *__unused act) {
+                if (wq_refuse_if_deleting_off(self)) return;
+                dispatch_async(wq_io(), ^{
+                    NSString *err = nil;
+                    wq_delete_backup(path, &err);
+                    dispatch_async(dispatch_get_main_queue(), ^{ [self reloadBackups]; });
+                });
+            })];
+            [self presentViewController:ask animated:YES completion:nil];
+        })];
+    }
+    [sheet addAction:wq_alert_action(WQLocalized(@"Cancel"), UIAlertActionStyleCancel, nil)];
+    sheet.popoverPresentationController.sourceView = source ?: self.view;
+    sheet.popoverPresentationController.sourceRect = (source ?: self.view).bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 @end
