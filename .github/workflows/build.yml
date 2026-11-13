@@ -1,0 +1,42 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # build.sh targets iOS 26.0, which needs the Xcode 26 iOS SDK.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # Runs tests/run_all_tests.sh as preflight, then compiles, ad-hoc signs
+      # and validates WQFiles.ipa.
+      - name: Build WQFiles.ipa
+        run: ./build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WQFiles-${{ github.sha }}
+          path: WQFiles.ipa
+          if-no-files-found: error
